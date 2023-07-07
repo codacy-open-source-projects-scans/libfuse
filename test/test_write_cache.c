@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <stddef.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <pthread.h>
 
 #ifndef __linux__
@@ -37,7 +38,7 @@ struct options {
     int delay_ms;
 } options = {
     .writeback = 0,
-    .data_size = 4096,
+    .data_size = 2048,
     .delay_ms = 0,
 };
 
