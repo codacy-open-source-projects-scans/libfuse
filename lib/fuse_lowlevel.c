@@ -2019,6 +2019,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 				bufsize = max_bufsize;
 			}
 		}
+		if (inargflags & FUSE_DIRECT_IO_ALLOW_MMAP)
+			se->conn.capable |= FUSE_CAP_DIRECT_IO_ALLOW_MMAP;
 		if (arg->minor >= 38)
 			se->conn.capable |= FUSE_CAP_EXPIRE_ONLY;
 	} else {
@@ -2051,7 +2053,6 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 	if ((cond) && (se->conn.capable & (cap))) \
 		se->conn.want |= (cap)
 	LL_SET_DEFAULT(1, FUSE_CAP_ASYNC_READ);
-	LL_SET_DEFAULT(1, FUSE_CAP_PARALLEL_DIROPS);
 	LL_SET_DEFAULT(1, FUSE_CAP_AUTO_INVAL_DATA);
 	LL_SET_DEFAULT(1, FUSE_CAP_HANDLE_KILLPRIV);
 	LL_SET_DEFAULT(1, FUSE_CAP_ASYNC_DIO);
@@ -2151,6 +2152,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		outargflags |= FUSE_EXPLICIT_INVAL_DATA;
 	if (se->conn.want & FUSE_CAP_SETXATTR_EXT)
 		outargflags |= FUSE_SETXATTR_EXT;
+	if (se->conn.want & FUSE_CAP_DIRECT_IO_ALLOW_MMAP)
+		outargflags |= FUSE_DIRECT_IO_ALLOW_MMAP;
 
 	if (inargflags & FUSE_INIT_EXT) {
 		outargflags |= FUSE_INIT_EXT;

@@ -336,8 +336,6 @@ struct fuse_loop_config_v1 {
  * is unset, the FUSE kernel module will ensure that lookup() and
  * readdir() requests are never issued concurrently for the same
  * directory.
- *
- * This feature is enabled by default when supported by the kernel.
  */
 #define FUSE_CAP_PARALLEL_DIROPS        (1 << 18)
 
@@ -439,6 +437,15 @@ struct fuse_loop_config_v1 {
  * For example FUSE_SETXATTR_ACL_KILL_SGID might be set.
  */
 #define FUSE_CAP_SETXATTR_EXT     (1 << 27)
+
+/**
+ * Files opened with FUSE_DIRECT_IO do not support MAP_SHARED mmap. This restriction
+ * is relaxed through FUSE_CAP_DIRECT_IO_RELAX (kernel flag: FUSE_DIRECT_IO_RELAX).
+ * MAP_SHARED is disabled by default for FUSE_DIRECT_IO, as this flag can be used to
+ * ensure coherency between mount points (or network clients) and with kernel page
+ * cache as enforced by mmap that cannot be guaranteed anymore.
+ */
+#define FUSE_CAP_DIRECT_IO_ALLOW_MMAP  (1 << 27)
 
 /**
  * Ioctl flags
