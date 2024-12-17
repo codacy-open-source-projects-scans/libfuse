@@ -7,6 +7,7 @@
 
 /** @file */
 
+#include <stdbool.h>
 #if !defined(FUSE_H_) && !defined(FUSE_LOWLEVEL_H_)
 #error "Never include <fuse_common.h> directly; use <fuse.h> or <fuse_lowlevel.h> instead."
 #endif
@@ -494,6 +495,14 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_PASSTHROUGH      (1 << 29)
 
 /**
+ * Indicates that the file system cannot handle NFS export
+ *
+ * If this flag is set NFS export and name_to_handle_at
+ * is not going to work at all and will fail with EOPNOTSUPP.
+ */
+#define FUSE_CAP_NO_EXPORT_SUPPORT  (1 << 30)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine
@@ -859,6 +868,14 @@ struct fuse_buf {
 	 * Used if FUSE_BUF_FD_SEEK flag is set.
 	 */
 	off_t pos;
+
+	/**
+	 * Size of memory pointer
+	 *
+	 * Used only if mem was internally allocated.
+	 * Not used if mem was user-provided.
+	 */
+	size_t mem_size;
 };
 
 /**
@@ -915,6 +932,7 @@ struct libfuse_version
 			/* .mem =   */ NULL,			\
 			/* .fd =    */ -1,			\
 			/* .pos =   */ 0,			\
+			/* .mem_size = */ 0,                    \
 		} }						\
 	} )
 
@@ -1033,6 +1051,23 @@ void fuse_loop_cfg_set_clone_fd(struct fuse_loop_config *config,
 void fuse_loop_cfg_convert(struct fuse_loop_config *config,
 			   struct fuse_loop_config_v1 *v1_conf);
 #endif
+
+
+static inline bool fuse_set_feature_flag(struct fuse_conn_info *conn,
+					 uint64_t flag)
+{
+	if (conn->capable & flag) {
+		conn->want |= flag;
+		return true;
+	}
+	return false;
+}
+
+static inline void fuse_unset_feature_flag(struct fuse_conn_info *conn,
+					 uint64_t flag)
+{
+	conn->want &= ~flag;
+}
 
 /* ----------------------------------------------------------- *
  * Compatibility stuff					       *

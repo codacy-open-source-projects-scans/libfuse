@@ -9,6 +9,7 @@
   See the file COPYING.LIB
 */
 
+#include <stdbool.h>
 #define _GNU_SOURCE
 
 #include "fuse_config.h"
@@ -22,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdalign.h>
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
@@ -445,7 +447,7 @@ int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e)
 int fuse_reply_create(fuse_req_t req, const struct fuse_entry_param *e,
 		      const struct fuse_file_info *f)
 {
-	char buf[sizeof(struct fuse_entry_out) + sizeof(struct fuse_open_out)];
+	alignas(uint64_t) char buf[sizeof(struct fuse_entry_out) + sizeof(struct fuse_open_out)];
 	size_t entrysize = req->se->conn.proto_minor < 9 ?
 		FUSE_COMPAT_ENTRY_OUT_SIZE : sizeof(struct fuse_entry_out);
 	struct fuse_entry_out *earg = (struct fuse_entry_out *) buf;
@@ -1359,6 +1361,24 @@ static void do_link(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		fuse_reply_err(req, ENOSYS);
 }
 
+static void do_tmpfile(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
+{
+	struct fuse_create_in *arg = (struct fuse_create_in *) inarg;
+
+	if (req->se->op.tmpfile) {
+		struct fuse_file_info fi;
+
+		memset(&fi, 0, sizeof(fi));
+		fi.flags = arg->flags;
+
+		if (req->se->conn.proto_minor >= 12)
+			req->ctx.umask = arg->umask;
+
+		req->se->op.tmpfile(req, nodeid, arg->mode, &fi);
+	} else
+		fuse_reply_err(req, ENOSYS);
+}
+
 static void do_create(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 {
 	struct fuse_create_in *arg = (struct fuse_create_in *) inarg;
@@ -1965,6 +1985,18 @@ static void do_lseek(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		fuse_reply_err(req, ENOSYS);
 }
 
+static bool want_flags_valid(uint64_t capable, uint64_t want)
+{
+	uint64_t unknown_flags = want & (~capable);
+	if (unknown_flags != 0) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: unknown connection 'want' flags: 0x%08lx\n",
+			unknown_flags);
+		return false;
+	}
+	return true;
+}
+
 /* Prevent bogus data races (bogus since "init" is called before
  * multi-threading becomes relevant */
 static __attribute__((no_sanitize("thread")))
@@ -1977,6 +2009,7 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 	size_t outargsize = sizeof(outarg);
 	uint64_t inargflags = 0;
 	uint64_t outargflags = 0;
+	bool buf_reallocable = se->buf_reallocable;
 	(void) nodeid;
 	if (se->debug) {
 		fuse_log(FUSE_LOG_DEBUG, "INIT: %u.%u\n", arg->major, arg->minor);
@@ -2061,6 +2094,7 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 			if (bufsize > max_bufsize) {
 				bufsize = max_bufsize;
 			}
+			buf_reallocable = false;
 		}
 		if (inargflags & FUSE_DIRECT_IO_ALLOW_MMAP)
 			se->conn.capable |= FUSE_CAP_DIRECT_IO_ALLOW_MMAP;
@@ -2068,6 +2102,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 			se->conn.capable |= FUSE_CAP_EXPIRE_ONLY;
 		if (inargflags & FUSE_PASSTHROUGH)
 			se->conn.capable |= FUSE_CAP_PASSTHROUGH;
+		if (inargflags & FUSE_NO_EXPORT_SUPPORT)
+			se->conn.capable |= FUSE_CAP_NO_EXPORT_SUPPORT;
 	} else {
 		se->conn.max_readahead = 0;
 	}
@@ -2121,10 +2157,7 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 	if (se->op.init)
 		se->op.init(se->userdata, &se->conn);
 
-	if (se->conn.want & (~se->conn.capable)) {
-		fuse_log(FUSE_LOG_ERR, "fuse: error: filesystem requested capabilities "
-			"0x%x that are not supported by kernel, aborting.\n",
-			se->conn.want & (~se->conn.capable));
+	if (!want_flags_valid(se->conn.capable, se->conn.want)) {
 		fuse_reply_err(req, EPROTO);
 		se->error = -EPROTO;
 		fuse_session_exit(se);
@@ -2149,6 +2182,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		bufsize = FUSE_MIN_READ_BUFFER;
 	}
 
+	if (buf_reallocable)
+	    bufsize = UINT_MAX;
 	se->conn.max_write = MIN(se->conn.max_write, bufsize - FUSE_BUFFER_HEADER_SIZE);
 	se->bufsize = se->conn.max_write + FUSE_BUFFER_HEADER_SIZE;
 
@@ -2207,6 +2242,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		 */
 		outarg.max_stack_depth = se->conn.max_backing_stack_depth + 1;
 	}
+	if (se->conn.want & FUSE_CAP_NO_EXPORT_SUPPORT)
+		outargflags |= FUSE_NO_EXPORT_SUPPORT;
 
 	if (inargflags & FUSE_INIT_EXT) {
 		outargflags |= FUSE_INIT_EXT;
@@ -2659,6 +2696,7 @@ static struct {
 	[FUSE_SETLKW]	   = { do_setlkw,      "SETLKW"	     },
 	[FUSE_ACCESS]	   = { do_access,      "ACCESS"	     },
 	[FUSE_CREATE]	   = { do_create,      "CREATE"	     },
+	[FUSE_TMPFILE]	   = { do_tmpfile,     "TMPFILE"	},
 	[FUSE_INTERRUPT]   = { do_interrupt,   "INTERRUPT"   },
 	[FUSE_BMAP]	   = { do_bmap,	       "BMAP"	     },
 	[FUSE_IOCTL]	   = { do_ioctl,       "IOCTL"	     },
@@ -2907,30 +2945,6 @@ static void fuse_ll_pipe_destructor(void *data)
 	fuse_ll_pipe_free(llp);
 }
 
-static unsigned int get_max_pages(void)
-{
-	char buf[32];
-	long res;
-	int fd;
-	int err;
-
-	fd = open("/proc/sys/fs/fuse/max_pages_limit", O_RDONLY);
-	if (fd < 0)
-		return FUSE_DEFAULT_MAX_PAGES_LIMIT;
-
-	res = read(fd, buf, sizeof(buf) - 1);
-
-	close(fd);
-
-	if (res < 0)
-		return FUSE_DEFAULT_MAX_PAGES_LIMIT;
-
-	buf[res] = '\0';
-
-	err = libfuse_strtol(buf, &res);
-	return err ? FUSE_DEFAULT_MAX_PAGES_LIMIT : res;
-}
-
 int fuse_session_receive_buf(struct fuse_session *se, struct fuse_buf *buf)
 {
 	return fuse_session_receive_buf_int(se, buf, NULL);
@@ -2941,8 +2955,8 @@ int fuse_session_receive_buf_int(struct fuse_session *se, struct fuse_buf *buf,
 {
 	int err;
 	ssize_t res;
-#ifdef HAVE_SPLICE
 	size_t bufsize = se->bufsize;
+#ifdef HAVE_SPLICE
 	struct fuse_ll_pipe *llp;
 	struct fuse_buf tmpbuf;
 
@@ -3022,6 +3036,8 @@ int fuse_session_receive_buf_int(struct fuse_session *se, struct fuse_buf *buf,
 					"fuse: failed to allocate read buffer\n");
 				return -ENOMEM;
 			}
+			buf->mem_size = se->bufsize;
+			se->buf_reallocable = true;
 		}
 		buf->size = se->bufsize;
 		buf->flags = 0;
@@ -3059,22 +3075,40 @@ fallback:
 				"fuse: failed to allocate read buffer\n");
 			return -ENOMEM;
 		}
+		buf->mem_size = se->bufsize;
+		se->buf_reallocable = true;
 	}
 
 restart:
+	if (se->buf_reallocable)
+	    bufsize = buf->mem_size;
 	if (se->io != NULL) {
 		/* se->io->read is never NULL if se->io is not NULL as
 		specified by fuse_session_custom_io()*/
-		res = se->io->read(ch ? ch->fd : se->fd, buf->mem, se->bufsize,
+		res = se->io->read(ch ? ch->fd : se->fd, buf->mem, bufsize,
 					 se->userdata);
 	} else {
-		res = read(ch ? ch->fd : se->fd, buf->mem, se->bufsize);
+		res = read(ch ? ch->fd : se->fd, buf->mem, bufsize);
 	}
 	err = errno;
 
 	if (fuse_session_exited(se))
 		return 0;
 	if (res == -1) {
+		if (err == EINVAL && se->buf_reallocable && se->bufsize > buf->mem_size)  {
+		    void *newbuf  = malloc(se->bufsize);
+		    if (!newbuf) {
+			fuse_log(FUSE_LOG_ERR,
+				"fuse: failed to (re)allocate read buffer\n");
+			return -ENOMEM;
+		    }
+		    free(buf->mem);
+		    buf->mem = newbuf;
+		    buf->mem_size = se->bufsize;
+		    se->buf_reallocable = true;
+		    goto restart;
+		}
+
 		/* ENOENT means the operation was interrupted, it's safe
 		   to restart */
 		if (err == ENOENT)
@@ -3130,7 +3164,8 @@ struct fuse_session *_fuse_session_new_317(struct fuse_args *args,
 		goto out1;
 	}
 	se->fd = -1;
-	se->conn.max_write = UINT_MAX;
+	se->conn.max_write = FUSE_DEFAULT_MAX_PAGES_LIMIT * getpagesize();
+	se->bufsize = se->conn.max_write + FUSE_BUFFER_HEADER_SIZE;
 	se->conn.max_readahead = UINT_MAX;
 
 	/* Parse options */
@@ -3165,9 +3200,6 @@ struct fuse_session *_fuse_session_new_317(struct fuse_args *args,
 
 	if (se->debug)
 		fuse_log(FUSE_LOG_DEBUG, "FUSE library version: %s\n", PACKAGE_VERSION);
-
-	se->bufsize = get_max_pages() * getpagesize() +
-		FUSE_BUFFER_HEADER_SIZE;
 
 	list_init_req(&se->list);
 	list_init_req(&se->interrupts);
