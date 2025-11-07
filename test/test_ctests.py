@@ -20,6 +20,10 @@ import os.path
 
 pytestmark = fuse_test_marker()
 
+def test_abi():
+    cmdline = [ pjoin(basename, 'test', 'test_abi') ]
+    subprocess.check_call(cmdline)
+
 @pytest.mark.skipif('FUSE_CAP_WRITEBACK_CACHE' not in fuse_caps,
                     reason='not supported by running kernel')
 @pytest.mark.parametrize("writeback", (False, True))
@@ -144,3 +148,14 @@ def test_notify_file_size(tmpdir, notify, output_checker):
             logger.error(f"Failure in unmount: '{' '.join(cmdline)}'")
             cleanup(mount_process, mnt_dir)
         logger.debug("Unmount completed")
+
+def test_signals(output_checker):
+    """Test for proper signal handling (issue #1182)"""
+    logger = logging.getLogger(__name__)
+    logger.debug("Testing signal handling")
+    cmdline = [ pjoin(basename, 'test', 'test_signals') ]
+    logger.debug(f"Command line: {' '.join(cmdline)}")
+    subprocess.run(cmdline, stdout=output_checker.fd, \
+                   stderr=output_checker.fd, timeout=10, check=True)
+    logger.debug("Signal handling test completed successfully")
+
