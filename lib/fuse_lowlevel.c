@@ -3995,12 +3995,15 @@ pipe_retry:
 				res = grow_pipe_to_max(llp->pipe[0]);
 				if (res > 0)
 					llp->size = res;
+				fuse_ll_clear_pipe(se);
 				goto fallback;
 			}
 			llp->size = res;
 		}
-		if (llp->size < bufsize)
+		if (llp->size < bufsize) {
+			fuse_ll_clear_pipe(se);
 			goto fallback;
+		}
 	}
 
 	if (se->io != NULL && se->io->splice_receive != NULL) {
@@ -4438,17 +4441,16 @@ int fuse_session_mount(struct fuse_session *se, const char *_mountpoint)
 				fd);
 			goto error_out;
 		}
-		se->fd = fd;
-		return 0;
+		goto out;
 	}
 
 	/* Open channel */
 	fd = fuse_kern_mount(mountpoint, se->mo);
 	if (fd == -1)
 		goto error_out;
-	se->fd = fd;
 
-	/* Save mountpoint */
+out:
+	se->fd = fd;
 	se->mountpoint = mountpoint;
 
 	return 0;
