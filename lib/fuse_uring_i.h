@@ -21,6 +21,7 @@
 /* io-uring defaults */
 #define SESSION_DEF_URING_ENABLE (0)
 #define SESSION_DEF_URING_Q_DEPTH (8)
+#define SESSION_DEF_URING_BUFPOOL (0)
 
 void fuse_session_process_uring_cqe(struct fuse_session *se,
 				    struct fuse_req *req,
@@ -40,6 +41,7 @@ int send_reply_uring(fuse_req_t req, int error, const void *arg,
 int fuse_reply_data_uring(fuse_req_t req, struct fuse_bufvec *bufv,
 			  enum fuse_buf_copy_flags flags);
 int fuse_send_msg_uring(fuse_req_t req, struct iovec *iov, int count);
+void fuse_uring_req_done(fuse_req_t req);
 
 #else // HAVE_URING
 
@@ -79,6 +81,10 @@ static inline int fuse_send_msg_uring(fuse_req_t req FUSE_VAR_UNUSED,
 				      int count FUSE_VAR_UNUSED)
 {
 	return -ENOTSUP;
+}
+
+static inline void fuse_uring_req_done(fuse_req_t req FUSE_VAR_UNUSED)
+{
 }
 
 #endif // HAVE_URING

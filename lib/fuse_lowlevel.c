@@ -19,6 +19,13 @@
 #include "mount_util.h"
 #include "util.h"
 #include "fuse_uring_i.h"
+#include "fuse_cap_names_i.h"
+#include "fuse_daemonize_i.h"
+#include "fuse_daemonize.h"
+#include "fuse_tsan_i.h"
+#if defined(__linux__)
+#include "mount_i_linux.h"
+#endif
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -28,6 +35,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/eventfd.h>
 #include <stdalign.h>
 #include <string.h>
@@ -37,6 +46,7 @@
 #include <assert.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <stdalign.h>
 #include <poll.h>
 
@@ -49,6 +59,10 @@
 #endif
 #ifndef F_SETPIPE_SZ
 #define F_SETPIPE_SZ	(F_LINUX_SPECIFIC_BASE + 7)
+#endif
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
 #endif
 
 #define PARAM(inarg) (((char *)(inarg)) + sizeof(*(inarg)))
@@ -75,10 +89,40 @@ struct fuse_timeout_thread {
 	pthread_mutex_t lock;
 	bool session_destructed;
 
+	/* eventfd wakeups without it mean the session fd is being closed */
+	bool stop_requested;
+
 	/* callback on timeout, if NULL exit(1) is called */
 	fuse_timeout_cb timeout_cb;
 	void *cb_data;
 };
+
+static void fuse_session_watchdog_wake(struct fuse_timeout_thread *tt)
+{
+	uint64_t val = 1;
+
+	if (write(tt->eventfd, &val, sizeof(val)) == -1)
+		fuse_log(FUSE_LOG_ERR, "fuse: failed to signal eventfd: %s\n",
+			 strerror(errno));
+}
+
+/*
+ * Call before closing the session fd: the watchdog may already poll on that
+ * number, which the next open() can reuse. The eventfd makes its poll() return.
+ */
+static void fuse_session_watchdog_drop_session_fd(struct fuse_session *se)
+{
+	struct fuse_timeout_thread *tt = se->timeout_thread;
+
+	if (tt == NULL)
+		return;
+
+	pthread_mutex_lock(&tt->lock);
+	tt->fuse_session_fd = -1;
+	pthread_mutex_unlock(&tt->lock);
+
+	fuse_session_watchdog_wake(tt);
+}
 
 static size_t pagesize;
 
@@ -192,8 +236,20 @@ static void list_add_req(struct fuse_req *req, struct fuse_req *next)
 	next->prev = req;
 }
 
+/*
+ * Convert extension length units to bytes.
+ * Extension lengths in fuse_in_header.total_extlen are specified in units
+ * of 8 bytes (sizeof(uint64_t)).
+ * TODO: Propose adding this to include/uapi/linux/fuse.h in the kernel.
+ */
+#ifndef FUSE_EXT_SIZE
+#define FUSE_EXT_SIZE(units) ((size_t)(units) * sizeof(uint64_t))
+#endif
+
 static void destroy_req(fuse_req_t req)
 {
+	struct fuse_session *se = req->se;
+
 	if (req->flags.is_uring) {
 		fuse_log(FUSE_LOG_ERR, "Refusing to destruct uring req\n");
 		return;
@@ -201,21 +257,28 @@ static void destroy_req(fuse_req_t req)
 	assert(req->ch == NULL);
 	pthread_mutex_destroy(&req->lock);
 	free(req);
+	fuse_session_put(se);
 }
 
 void fuse_free_req(fuse_req_t req)
 {
 	int ctr;
 	struct fuse_session *se = req->se;
+	/* teardown may free a uring entry as soon as it looks idle */
+	const bool is_uring = req->flags.is_uring;
+
+	free(req->secctx);
+	req->secctx = NULL;
 
 	/* XXX: for now no support for interrupts with io-uring
 	 *      It actually might work already, though. But then would add
 	 *      a lock across ring queues.
 	 */
-	if (se->conn.no_interrupt || req->flags.is_uring) {
-		ctr = --req->ref_cnt;
+	if (se->conn.no_interrupt || is_uring) {
 		fuse_chan_put(req->ch);
 		req->ch = NULL;
+		/* publishes the entry as idle - do not touch req below */
+		ctr = --req->ref_cnt;
 	} else {
 		pthread_mutex_lock(&se->lock);
 		req->u.ni.func = NULL;
@@ -226,8 +289,14 @@ void fuse_free_req(fuse_req_t req)
 		req->ch = NULL;
 		pthread_mutex_unlock(&se->lock);
 	}
-	if (!ctr)
+
+	/* A uring entry is embedded in its queue and never destroyed here. */
+	if (is_uring) {
+		fuse_uring_req_done(req);
+		/* the queue, the pool and se may be gone now */
+	} else if (!ctr) {
 		destroy_req(req);
+	}
 }
 
 static struct fuse_req *fuse_ll_alloc_req(struct fuse_session *se)
@@ -242,6 +311,7 @@ static struct fuse_req *fuse_ll_alloc_req(struct fuse_session *se)
 		req->ref_cnt = 1;
 		list_init_req(req);
 		pthread_mutex_init(&req->lock, NULL);
+		fuse_session_get(se);
 	}
 
 	return req;
@@ -302,6 +372,10 @@ static int fuse_send_msg(struct fuse_session *se, struct fuse_chan *ch,
 				(unsigned long long) out->unique, out->len);
 		}
 	}
+
+	/* io-uring replies release when their SQE is committed */
+	if (!is_uring && out->unique != 0)
+		tsan_release_reply(se);
 
 	if (is_uring)
 		err = fuse_send_msg_uring(req, iov, count);
@@ -435,6 +509,10 @@ int fuse_reply_err(fuse_req_t req, int err)
 
 void fuse_reply_none(fuse_req_t req)
 {
+	if (req->flags.is_uring) {
+		send_reply_uring(req, 0, NULL, 0);
+		return;
+	}
 	fuse_free_req(req);
 }
 
@@ -796,7 +874,7 @@ static int grow_pipe_to_max(int pipefd)
 	long maxfd;
 	char buf[32];
 
-	maxfd = open("/proc/sys/fs/pipe-max-size", O_RDONLY);
+	maxfd = open("/proc/sys/fs/pipe-max-size", O_RDONLY | O_CLOEXEC);
 	if (maxfd < 0)
 		return -errno;
 
@@ -874,6 +952,10 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
 		if (llp->can_grow) {
 			res = fcntl(llp->pipe[0], F_SETPIPE_SZ, pipesize);
 			if (res == -1) {
+				/*
+				 * pipesize above is per-request; grow to max so later
+				 * (smaller) splice-write requests can still succeed.
+				 */
 				res = grow_pipe_to_max(llp->pipe[0]);
 				if (res > 0)
 					llp->size = res;
@@ -996,6 +1078,7 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
 	    (se->conn.want_ext & FUSE_CAP_SPLICE_MOVE))
 		splice_flags |= SPLICE_F_MOVE;
 
+	tsan_release_reply(se);
 	if (se->io != NULL && se->io->splice_send != NULL) {
 		res = se->io->splice_send(llp->pipe[0], NULL,
 						  ch ? ch->fd : se->fd, NULL, out->len,
@@ -1684,7 +1767,9 @@ static void _do_create(fuse_req_t req, const fuse_ino_t nodeid,
 		if (req->se->conn.proto_minor >= 12)
 			req->ctx.umask = arg->umask;
 
-		/* XXX: fuse_create_in::open_flags */
+		if (req->se->conn.want_ext & FUSE_CAP_HANDLE_KILLPRIV_V2)
+			fi.kill_suidgid =
+				(arg->open_flags & FUSE_OPEN_KILL_SUIDGID) != 0;
 
 		req->se->op.create(req, nodeid, name, arg->mode, &fi);
 	} else {
@@ -1714,7 +1799,9 @@ static void _do_open(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	memset(&fi, 0, sizeof(fi));
 	fi.flags = arg->flags;
 
-	/* XXX: fuse_open_in::open_flags */
+	if (req->se->conn.want_ext & FUSE_CAP_HANDLE_KILLPRIV_V2)
+		fi.kill_suidgid =
+			(arg->open_flags & FUSE_OPEN_KILL_SUIDGID) != 0;
 
 	if (req->se->op.open)
 		req->se->op.open(req, nodeid, &fi);
@@ -1765,6 +1852,10 @@ static void _do_write(fuse_req_t req, const fuse_ino_t nodeid,
 	fi.fh = arg->fh;
 	fi.writepage = (arg->write_flags & FUSE_WRITE_CACHE) != 0;
 
+	if (req->se->conn.want_ext & FUSE_CAP_HANDLE_KILLPRIV_V2)
+		fi.kill_suidgid =
+			(arg->write_flags & FUSE_WRITE_KILL_SUIDGID) != 0;
+
 	if (req->se->conn.proto_minor >= 9) {
 		fi.lock_owner = arg->lock_owner;
 		fi.flags = arg->flags;
@@ -1800,6 +1891,10 @@ static void _do_write_buf(fuse_req_t req, const fuse_ino_t nodeid,
 	memset(&fi, 0, sizeof(fi));
 	fi.fh = arg->fh;
 	fi.writepage = arg->write_flags & FUSE_WRITE_CACHE;
+
+	if (se->conn.want_ext & FUSE_CAP_HANDLE_KILLPRIV_V2)
+		fi.kill_suidgid =
+			(arg->write_flags & FUSE_WRITE_KILL_SUIDGID) != 0;
 
 	if (se->conn.proto_minor >= 9) {
 		fi.lock_owner = arg->lock_owner;
@@ -2310,6 +2405,15 @@ static void do_interrupt(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 	_do_interrupt(req, nodeid, inarg, NULL);
 }
 
+/* caller holds se->lock */
+static void destroy_parked_interrupt(struct fuse_req *intr)
+{
+	list_del_req(intr);
+	fuse_chan_put(intr->ch);
+	intr->ch = NULL;
+	destroy_req(intr);
+}
+
 static struct fuse_req *check_interrupt(struct fuse_session *se,
 					struct fuse_req *req)
 {
@@ -2319,10 +2423,7 @@ static struct fuse_req *check_interrupt(struct fuse_session *se,
 	     curr = curr->next) {
 		if (curr->u.i.unique == req->unique) {
 			req->interrupted = 1;
-			list_del_req(curr);
-			fuse_chan_put(curr->ch);
-			curr->ch = NULL;
-			destroy_req(curr);
+			destroy_parked_interrupt(curr);
 			return NULL;
 		}
 	}
@@ -2673,6 +2774,72 @@ bool fuse_get_feature_flag(const struct fuse_conn_info *conn,
 	return (conn->capable_ext & flag) ? true : false;
 }
 
+bool fuse_set_conn_flag(struct fuse_conn_info *conn, uint64_t flag)
+{
+	switch (flag) {
+	case FUSE_CONN_FLAG_SINGLE_ISSUER:
+		conn->io_uring_single_issuer = 1;
+		return true;
+	case FUSE_CONN_FLAG_NO_INTERRUPT:
+		conn->no_interrupt = 1;
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * Test-only: report the FUSE_INIT negotiation -- capabilities and scalars
+ * alike -- one "FUSE_INIT: FUSE_CAP_*" line per negotiated capability and one
+ * "FUSE_INIT: key=value" line per scalar. The prefix is what lets a reader
+ * pick the report out of a daemon log that carries everything else too.
+ *
+ * $FUSE_INIT_STATUS asks for it; it carries no destination, because the
+ * report goes where everything else the session logs goes. A path would be a
+ * write-anywhere gadget for any daemon that inherits its environment across a
+ * privilege boundary, and no getenv() guard makes that safe enough to be worth
+ * having. A real caller never sets the variable, so this is a no-op outside
+ * the test suite.
+ *
+ * ring_rc is passed in because a fuse_uring_start() that failed leaves no
+ * trace on the session to reconstruct it from.
+ */
+static void report_init_test_status(struct fuse_session *se, int ring_rc)
+{
+	const struct fuse_conn_info *conn = &se->conn;
+
+	for (const struct fuse_cap_name *cap = fuse_cap_names; cap->name; cap++) {
+		if (conn->want_ext & cap->flag)
+			EMIT_INIT_STATUS_LINE("%s", cap->name);
+	}
+	/* Absence from the list above does not say why, and only the session
+	 * knows: an impossible ring and a failed one are different verdicts.
+	 */
+	if (conn->want_ext & FUSE_CAP_OVER_IO_URING)
+		EMIT_INIT_STATUS_LINE("io_uring=on");
+	else if (ring_rc != 0)
+		EMIT_INIT_STATUS_LINE("io_uring=off:start_failed:%s",
+				      strerror(-ring_rc));
+	else if (se->io != NULL)
+		EMIT_INIT_STATUS_LINE("io_uring=off:custom_io");
+	else if (!se->uring.enabled)
+		EMIT_INIT_STATUS_LINE("io_uring=off:disabled");
+	else if (!(conn->capable_ext & FUSE_CAP_OVER_IO_URING))
+		EMIT_INIT_STATUS_LINE("io_uring=off:not_offered");
+	else
+		EMIT_INIT_STATUS_LINE("io_uring=off:not_wanted");
+	EMIT_INIT_STATUS_LINE("proto_major=%u", conn->proto_major);
+	EMIT_INIT_STATUS_LINE("proto_minor=%u", conn->proto_minor);
+	EMIT_INIT_STATUS_LINE("max_readahead=%u", conn->max_readahead);
+	EMIT_INIT_STATUS_LINE("max_write=%u", conn->max_write);
+	EMIT_INIT_STATUS_LINE("max_background=%u", conn->max_background);
+	EMIT_INIT_STATUS_LINE("congestion_threshold=%u", conn->congestion_threshold);
+	EMIT_INIT_STATUS_LINE("time_gran=%u", conn->time_gran);
+	EMIT_INIT_STATUS_LINE("request_timeout=%u", conn->request_timeout);
+	if (conn->want_ext & FUSE_CAP_PASSTHROUGH)
+		EMIT_INIT_STATUS_LINE("max_stack_depth=%u", conn->max_backing_stack_depth + 1);
+}
+
 /* Prevent bogus data races (bogus since "init" is called before
  * multi-threading becomes relevant */
 static __attribute__((no_sanitize("thread"))) void
@@ -2690,6 +2857,7 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	bool buf_reallocable = se->buf_reallocable;
 	(void) nodeid;
 	bool enable_io_uring = false;
+	int ring_rc = 0;
 
 	if (se->debug) {
 		fuse_log(FUSE_LOG_DEBUG, "INIT: %u.%u\n", arg->major, arg->minor);
@@ -2786,9 +2954,12 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			se->conn.capable_ext |= FUSE_CAP_NO_EXPORT_SUPPORT;
 		if (inargflags & FUSE_OVER_IO_URING)
 			se->conn.capable_ext |= FUSE_CAP_OVER_IO_URING;
+		if (inargflags & FUSE_HAS_IO_URING_BUFPOOL)
+			se->conn.capable_ext |= FUSE_CAP_IO_URING_BUFPOOL;
 		if (inargflags & FUSE_ALLOW_IDMAP)
 			se->conn.capable_ext |= FUSE_CAP_ALLOW_IDMAP;
-
+		if (inargflags & FUSE_SECURITY_CTX)
+			se->conn.capable_ext |= FUSE_CAP_SECURITY_CTX;
 	} else {
 		se->conn.max_readahead = 0;
 	}
@@ -2833,6 +3004,7 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	LL_SET_DEFAULT(se->op.readdirplus && se->op.readdir,
 		       FUSE_CAP_READDIRPLUS_AUTO);
 	LL_SET_DEFAULT(1, FUSE_CAP_OVER_IO_URING);
+	LL_SET_DEFAULT(se->uring.bufpool, FUSE_CAP_IO_URING_BUFPOOL);
 
 	/* This could safely become default, but libfuse needs an API extension
 	 * to support it
@@ -2873,6 +3045,11 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		return;
 	}
 
+	if (se->conn.max_read != 0 && se->conn.max_read < getpagesize()) {
+		fuse_log(FUSE_LOG_WARNING, "fuse: maximum read size below page size\n");
+		se->conn.max_read = getpagesize();
+	}
+
 	if (bufsize < FUSE_MIN_READ_BUFFER) {
 		fuse_log(FUSE_LOG_ERR,
 			 "fuse: warning: buffer size too small: %zu\n",
@@ -2883,6 +3060,12 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	if (buf_reallocable)
 	    bufsize = UINT_MAX;
 	se->conn.max_write = MIN(se->conn.max_write, bufsize - FUSE_BUFFER_HEADER_SIZE);
+
+	if (se->conn.max_write < getpagesize()) {
+		fuse_log(FUSE_LOG_WARNING, "fuse: maximum write size below page size\n");
+		se->conn.max_write = getpagesize();
+	}
+
 	se->bufsize = se->conn.max_write + FUSE_BUFFER_HEADER_SIZE;
 
 	if (arg->flags & FUSE_MAX_PAGES) {
@@ -2942,10 +3125,12 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	}
 	if (se->conn.want_ext & FUSE_CAP_NO_EXPORT_SUPPORT)
 		outargflags |= FUSE_NO_EXPORT_SUPPORT;
-	if (se->uring.enable && se->conn.want_ext & FUSE_CAP_OVER_IO_URING) {
+	if (se->uring.enabled && se->conn.want_ext & FUSE_CAP_OVER_IO_URING) {
 		outargflags |= FUSE_OVER_IO_URING;
 		enable_io_uring = true;
 	}
+	if (se->conn.want_ext & FUSE_CAP_SECURITY_CTX)
+		outargflags |= FUSE_SECURITY_CTX;
 	if (se->conn.want_ext & FUSE_CAP_ALLOW_IDMAP)
 		outargflags |= FUSE_ALLOW_IDMAP;
 
@@ -2972,6 +3157,48 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	if (se->conn.proto_minor >= 23)
 		outarg.time_gran = se->conn.time_gran;
 
+	if (arg->minor < 5)
+		outargsize = FUSE_COMPAT_INIT_OUT_SIZE;
+	else if (arg->minor < 23)
+		outargsize = FUSE_COMPAT_22_INIT_OUT_SIZE;
+
+	/* XXX: Add an option to make non-available io-uring fatal */
+	if (enable_io_uring) {
+		ring_rc = fuse_uring_start(se);
+
+		if (ring_rc != 0) {
+			fuse_log(FUSE_LOG_INFO,
+				 "fuse: failed to start io-uring: %s\n",
+				 strerror(-ring_rc));
+			outargflags &= ~FUSE_OVER_IO_URING;
+			enable_io_uring = false;
+		}
+	}
+	/* Once the reply is composed want_ext is the negotiation result, not a
+	 * wish list; io-uring is the only capability that can still be off.
+	 */
+	if (!enable_io_uring) {
+		fuse_unset_feature_flag(&se->conn, FUSE_CAP_OVER_IO_URING);
+		fuse_unset_feature_flag(&se->conn, FUSE_CAP_IO_URING_BUFPOOL);
+	}
+	if (se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL)
+		outargflags |= FUSE_HAS_IO_URING_BUFPOOL;
+
+	report_init_test_status(se, ring_rc);
+
+	/*
+	 * Only now, after the report has had its look at the wish - later
+	 * phases need to know whether the ring came up, not whether it was
+	 * asked for.
+	 */
+	se->uring.enabled = enable_io_uring;
+
+	if (inargflags & FUSE_INIT_EXT) {
+		outargflags |= FUSE_INIT_EXT;
+		outarg.flags2 = outargflags >> 32;
+	}
+	outarg.flags = outargflags;
+
 	if (se->debug) {
 		fuse_log(FUSE_LOG_DEBUG, "   INIT: %u.%u\n", outarg.major, outarg.minor);
 		fuse_log(FUSE_LOG_DEBUG, "   flags=0x%08x\n", outarg.flags);
@@ -2988,29 +3215,6 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			fuse_log(FUSE_LOG_DEBUG, "   max_stack_depth=%u\n",
 				outarg.max_stack_depth);
 	}
-	if (arg->minor < 5)
-		outargsize = FUSE_COMPAT_INIT_OUT_SIZE;
-	else if (arg->minor < 23)
-		outargsize = FUSE_COMPAT_22_INIT_OUT_SIZE;
-
-	/* XXX: Add an option to make non-available io-uring fatal */
-	if (enable_io_uring) {
-		int ring_rc = fuse_uring_start(se);
-
-		if (ring_rc != 0) {
-			fuse_log(FUSE_LOG_INFO,
-				 "fuse: failed to start io-uring: %s\n",
-				 strerror(ring_rc));
-			outargflags &= ~FUSE_OVER_IO_URING;
-			enable_io_uring = false;
-		}
-	}
-
-	if (inargflags & FUSE_INIT_EXT) {
-		outargflags |= FUSE_INIT_EXT;
-		outarg.flags2 = outargflags >> 32;
-	}
-	outarg.flags = outargflags;
 
 	/*
 	 * Has to be set before replying, as new kernel requests might
@@ -3018,10 +3222,29 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	 * Especially with external handlers, where we have no control
 	 * over the thread scheduling.
 	 */
-	se->got_init = 1;
+	WRITE_ONCE(se->got_init, 1);
+	fuse_daemonize_set_got_init();
 	send_reply_ok(req, &outarg, outargsize);
-	if (enable_io_uring)
+	/*
+	 * With async init, send_reply_ok() has already marked the connection
+	 * initialized (that happens in the reply write()), so the ring threads
+	 * can send REGISTER now. With sync init, _do_init() runs on the
+	 * sync-init worker thread while the mount is still in progress. The
+	 * connection is not initialized until the mount completes, which is
+	 * after _do_init() returns. Waking the ring threads here would let
+	 * REGISTER race ahead of initialization and get -EAGAIN, so defer the
+	 * wake to fuse_session_mount_new_api() after the mount returns.
+	 */
+	if (enable_io_uring && !se->is_sync_init)
 		fuse_uring_wake_ring_threads(se);
+
+	/*
+	 * With sync init the daemon needs to signal success after the mount
+	 * itself. Otherwise parent process might exit with success, but the
+	 *  mount point might not there yet.
+	 */
+	if (!se->is_sync_init)
+		fuse_daemonize_early_success();
 }
 
 static __attribute__((no_sanitize("thread"))) void
@@ -3046,7 +3269,7 @@ static void _do_destroy(fuse_req_t req, const fuse_ino_t nodeid,
 	}
 
 	se->got_destroy = 1;
-	se->got_init = 0;
+	WRITE_ONCE(se->got_init, 0);
 	if (se->op.destroy)
 		se->op.destroy(se->userdata);
 
@@ -3082,7 +3305,7 @@ static void list_init_nreq(struct fuse_notify_req *nreq)
 	nreq->prev = nreq;
 }
 
-static void do_notify_reply(fuse_req_t req, fuse_ino_t nodeid,
+static void _do_notify_reply(fuse_req_t req, fuse_ino_t nodeid,
 			    const void *inarg, const struct fuse_buf *buf)
 {
 	struct fuse_session *se = req->se;
@@ -3103,13 +3326,22 @@ static void do_notify_reply(fuse_req_t req, fuse_ino_t nodeid,
 		nreq->reply(nreq, req, nodeid, inarg, buf);
 }
 
+static void do_notify_reply(fuse_req_t req, fuse_ino_t nodeid,
+			    const void *inarg, const struct fuse_buf *ibuf)
+{
+	struct fuse_buf buf = *ibuf;
+
+	buf.size -= sizeof(struct fuse_in_header);
+	_do_notify_reply(req, nodeid, inarg, &buf);
+}
+
 static int send_notify_iov(struct fuse_session *se, int notify_code,
 			   struct iovec *iov, int count)
 {
 	struct fuse_out_header out;
 	struct fuse_req *req = NULL;
 
-	if (!se->got_init)
+	if (!READ_ONCE(se->got_init))
 		return -ENOTCONN;
 
 	out.unique = 0;
@@ -3186,7 +3418,7 @@ int fuse_lowlevel_notify_increment_epoch(struct fuse_session *se)
  *
  * @param se the session object
  * @param parent inode number
- * @param name file name
+ * @param name file name (null terminated)
  * @param namelen strlen() of file name
  * @param flags flags to control if the entry should be expired or invalidated
  * @return zero for success, -errno for failure
@@ -3322,8 +3554,7 @@ static void fuse_ll_retrieve_reply(struct fuse_notify_req *nreq,
 	if (!(bufv.buf[0].flags & FUSE_BUF_IS_FD))
 		bufv.buf[0].mem = PARAM(arg);
 
-	bufv.buf[0].size -= sizeof(struct fuse_in_header) +
-		sizeof(struct fuse_notify_retrieve_in);
+	bufv.buf[0].size -= sizeof(struct fuse_notify_retrieve_in);
 
 	if (bufv.buf[0].size < arg->size) {
 		fuse_log(FUSE_LOG_ERR, "fuse: retrieve reply: buffer size too small\n");
@@ -3421,6 +3652,96 @@ void *fuse_req_userdata(fuse_req_t req)
 const struct fuse_ctx *fuse_req_ctx(fuse_req_t req)
 {
 	return &req->ctx;
+}
+
+uint32_t fuse_req_secctx_count(fuse_req_t req)
+{
+	return req->secctx_count;
+}
+
+void fuse_req_secctx_reset(fuse_req_t req)
+{
+	req->secctx_iter_index = 0;
+	if (req->secctx && req->secctx_count > 0) {
+		req->secctx_iter_ptr = (const char *)req->secctx +
+			sizeof(struct fuse_secctx_header);
+	} else {
+		req->secctx_iter_ptr = NULL;
+	}
+}
+
+/**
+ * Iterate to the next security context in the request extension.
+ *
+ * Call this function repeatedly to iterate through all security contexts.
+ * Returns 0 on success, -ENOENT when no more contexts are available.
+ *
+ * IMPORTANT: After finishing iteration, the caller MUST call fuse_req_secctx_reset()
+ * to reset the iterator to the beginning before iterating again. The iterator maintains
+ * state and will not automatically reset.
+ */
+int fuse_req_secctx_next(fuse_req_t req, const char **name,
+			 const char **value, uint32_t *value_len)
+{
+	const char *buf_start = (const char *)req->secctx;
+	const char *buf_end = buf_start + req->secctx_len;
+
+	/* Check if we have more contexts to iterate */
+	if (req->secctx_iter_index >= req->secctx_count || !req->secctx_iter_ptr)
+		return -ENOENT;
+
+	/* Validate that fuse_secctx header fits in buffer */
+	if (req->secctx_iter_ptr + sizeof(struct fuse_secctx) > buf_end) {
+		fuse_log(FUSE_LOG_ERR, "fuse_secctx extends past buffer\n");
+		return -EIO;
+	}
+
+	/* Parse current security context */
+	const struct fuse_secctx *fctx = (const struct fuse_secctx *)req->secctx_iter_ptr;
+
+	/* empty security context is invalid */
+	if (fctx->size == 0) {
+		fuse_log(FUSE_LOG_ERR, "secctx has zero size\n");
+		return -EIO;
+	}
+
+	const char *ctx_name = (const char *)(fctx + 1);
+
+	/*
+	 * The name starts right after the header and must leave at least one
+	 * byte for its NUL inside the buffer. The header-fits check above uses
+	 * a strict '>', so ctx_name can land exactly on buf_end; without this
+	 * guard "buf_end - ctx_name - 1" underflows to SIZE_MAX and the strnlen
+	 * below reads past the allocation.
+	 */
+	if (ctx_name >= buf_end) {
+		fuse_log(FUSE_LOG_ERR, "secctx name extends past buffer\n");
+		return -EIO;
+	}
+
+	const size_t max_strlen = buf_end - ctx_name - 1;
+	const size_t name_size = strnlen(ctx_name, max_strlen) + 1;
+	const char *ctx_value = ctx_name + name_size;
+
+	/* Validate that value fits in buffer */
+	if (ctx_value + fctx->size > buf_end) {
+		fuse_log(FUSE_LOG_ERR, "secctx value extends past buffer\n");
+		return -EIO;
+	}
+
+	/* Return the parsed data */
+	if (name)
+		*name = ctx_name;
+	if (value)
+		*value = ctx_value;
+	if (value_len)
+		*value_len = fctx->size;
+
+	/* Advance iterator to next context (8-byte aligned) */
+	req->secctx_iter_ptr += FUSE_REC_ALIGN(sizeof(*fctx) + name_size + fctx->size);
+	req->secctx_iter_index++;
+
+	return 0;
 }
 
 void fuse_req_interrupt_func(fuse_req_t req, fuse_interrupt_func_t func,
@@ -3594,7 +3915,7 @@ fuse_req_opcode_sanity_ok(struct fuse_session *se, enum fuse_opcode in_op)
 {
 	int err = EIO;
 
-	if (!se->got_init) {
+	if (!READ_ONCE(se->got_init)) {
 		enum fuse_opcode expected;
 
 		expected = se->cuse_data ? CUSE_INIT : FUSE_INIT;
@@ -3606,6 +3927,119 @@ fuse_req_opcode_sanity_ok(struct fuse_session *se, enum fuse_opcode in_op)
 	return 0;
 }
 
+/**
+ * Parse FUSE extensions from a buffer, and just extract security context for now.
+ *
+ * @param req The FUSE request to populate with security context
+ * @param total_extlen Extension length in 8-byte units from the FUSE input header
+ * @param ext_buffer The buffer containing the extensions (for io_uring: op_payload,
+ *                   for non-io_uring: in header buffer)
+ * @param buffer_len The length of ext_buffer (for io_uring: payload_len,
+ *                   for non-io_uring: in->len)
+ */
+static void
+fuse_req_parse_extensions(struct fuse_req *req, uint32_t total_extlen,
+			  const void *ext_buffer, size_t buffer_len)
+{
+
+	/* Initialize security context fields */
+	req->secctx = NULL;
+	req->secctx_len = 0;
+	req->secctx_count = 0;
+	req->secctx_iter_index = 0;
+	req->secctx_iter_ptr = NULL;
+
+	if (total_extlen == 0)
+		return;
+
+	/*
+	 * Extensions are located at the END of the buffer after the operation-specific
+	 * header and payload. Extension data may include:
+	 * - Security context (FUSE_SECCTX, type 0-31)
+	 * - Supplementary groups (FUSE_EXT_GROUPS, type 32+)
+	 *
+	 * This parsing logic is identical for both io_uring and non-io_uring paths:
+	 * - Non-io_uring: ext_buffer points to the 'in' header buffer, extensions at end
+	 * - io_uring: ext_buffer points to the separate payload buffer, extensions at end
+	 * In both cases, we calculate the extension start position by subtracting the
+	 * extension size from the buffer length, since extensions are always at the END
+	 * of whatever buffer contains them.
+	 *
+	 * Multiple extensions may be present. We need to iterate through
+	 * them to find the security context extension.
+	 *
+	 * The extension header is polymorphic:
+	 * - struct { size, nr_secctx } if nr_secctx <= 31 (security context)
+	 * - struct { size, type } if type >= 32 (other extensions)
+	 *
+	 * total_extlen is in 8-byte units and gives the extension size.
+	 *
+	 * We must copy the security context because the source buffer
+	 * will be freed after the operation handler returns.
+	 */
+	size_t ext_bytes = FUSE_EXT_SIZE(total_extlen);
+
+	if (ext_bytes > buffer_len) {
+		fuse_log(FUSE_LOG_ERR,
+			"Extension size (%zu) exceeds buffer length (%zu)\n",
+			ext_bytes, buffer_len);
+		return;
+	}
+
+	/* Extensions are at the END of the buffer */
+	const char *buf_base = (const char *)ext_buffer;
+	const char *ext_start = buf_base + (buffer_len - ext_bytes);
+	const char *ext_end = ext_start + ext_bytes;
+	const char *ext_curr = ext_start;
+
+	/*
+	 * Iterate through all extensions to find security context.
+	 * Use memcpy to avoid unaligned access - extensions may not be
+	 * aligned within the buffer.
+	 */
+	while (ext_curr + sizeof(struct fuse_ext_header) <= ext_end) {
+		struct fuse_ext_header ext_hdr;
+		uint32_t second_field;
+
+		/* Use memcpy to safely read from potentially unaligned address */
+		memcpy(&ext_hdr, ext_curr, sizeof(ext_hdr));
+
+		/* Validate extension size */
+		if (ext_hdr.size < sizeof(ext_hdr) ||
+		    ext_curr + ext_hdr.size > ext_end) {
+			fuse_log(FUSE_LOG_ERR,
+				"Extension invalid: size=%u, remaining=%zu\n",
+				ext_hdr.size, (size_t)(ext_end - ext_curr));
+			break; /* Invalid extension, stop parsing */
+		}
+
+		second_field = ext_hdr.type;
+
+		/*
+		 * Distinguish based on second field value:
+		 * - 0-31: fuse_secctx_header (nr_secctx field)
+		 * - 32+:  fuse_ext_header (type field)
+		 */
+		if (second_field <= FUSE_MAX_NR_SECCTX && second_field > 0) {
+			/* Found security context extension */
+			req->secctx = malloc(ext_hdr.size);
+			if (req->secctx) {
+				memcpy(req->secctx, ext_curr, ext_hdr.size);
+				req->secctx_len = ext_hdr.size;
+				req->secctx_count = second_field; /* nr_secctx */
+				/* Initialize iterator */
+				fuse_req_secctx_reset(req);
+			}
+			break; /* Found and copied security context */
+		}
+		/*
+		 * Currently we don't handle the extensions other than secctx,
+		 * so skip to next extension (8-byte aligned)
+		 */
+		ext_curr += FUSE_REC_ALIGN(ext_hdr.size);
+	}
+}
+
 static inline void
 fuse_session_in2req(struct fuse_req *req, const struct fuse_in_header *in)
 {
@@ -3614,6 +4048,8 @@ fuse_session_in2req(struct fuse_req *req, const struct fuse_in_header *in)
 	req->ctx.gid = in->gid;
 	req->ctx.pid = in->pid;
 }
+
+
 
 /**
  * Implement -o allow_root
@@ -3674,6 +4110,8 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
 	struct fuse_bufvec bufv = { .buf[0] = *buf, .count = 1 };
 	struct fuse_bufvec tmpbuf = FUSE_BUFVEC_INIT(write_header_size);
 	struct fuse_in_header *in;
+	/* 'in' spans the whole request, not just the fixed header */
+	bool buf_is_complete;
 	const void *inarg;
 	struct fuse_req *req;
 	void *mbuf = NULL;
@@ -3696,8 +4134,10 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
 			goto clear_pipe;
 
 		in = mbuf;
+		buf_is_complete = (tmpbuf.buf[0].size == buf->size);
 	} else {
 		in = buf->mem;
+		buf_is_complete = true;
 	}
 
 	trace_request_process(in->opcode, in->unique);
@@ -3725,8 +4165,25 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
 		goto clear_pipe;
 	}
 
+	tsan_acquire_request(se);
 	fuse_session_in2req(req, in);
 	req->ch = ch ? fuse_chan_get(ch) : NULL;
+
+	/*
+	 * in->len is the sender's claim, buf->size is what the buffer holds.
+	 * Everything below reads the request through in->len, so a caller of
+	 * fuse_session_process_buf() that got the size wrong would take the
+	 * handlers past the allocation.
+	 */
+	if (unlikely(in->len < sizeof(struct fuse_in_header) ||
+		     buf->size < in->len)) {
+		fuse_log(FUSE_LOG_ERR,
+			"fuse: %s: %zu bytes for a %u-byte request\n",
+			opname((enum fuse_opcode) in->opcode), buf->size,
+			in->len);
+		err = EIO;
+		goto reply_err;
+	}
 
 	err = fuse_req_opcode_sanity_ok(se, in->opcode);
 	if (err)
@@ -3739,8 +4196,18 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
 	err = ENOSYS;
 	if (in->opcode >= FUSE_MAXOP || !fuse_ll_ops[in->opcode].func)
 		goto reply_err;
-	/* Do not process interrupt request */
-	if (se->conn.no_interrupt && in->opcode == FUSE_INTERRUPT) {
+	if (in->opcode == FUSE_INIT || in->opcode == CUSE_INIT) {
+		size_t hdr  = sizeof(struct fuse_in_header);
+		size_t have = buf->size < in->len ? buf->size : in->len;
+		size_t need = offsetof(struct fuse_init_in, max_readahead); /* 8: major+minor */
+		if (have < hdr || have - hdr < need) {
+			err = EPROTO;
+			goto reply_err;
+		}
+	}
+	/* Do not process interrupt request; a ring request cannot be found */
+	if ((se->conn.no_interrupt || se->uring.enabled) &&
+	    in->opcode == FUSE_INTERRUPT) {
 		if (se->debug)
 			fuse_log(FUSE_LOG_DEBUG, "FUSE_INTERRUPT: reply to kernel to disable interrupt\n");
 		goto reply_err;
@@ -3775,6 +4242,31 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
 			goto reply_err;
 
 		in = mbuf;
+		buf_is_complete = true;
+	}
+
+	/*
+	 * Extensions sit at the end of the request and are only reachable once
+	 * 'in' spans it. The splice path leaves FUSE_WRITE (with write_buf) and
+	 * FUSE_NOTIFY_REPLY payloads in the pipe; as of Linux 7.1 the kernel
+	 * attaches no extensions to those.
+	 */
+	if (in->total_extlen) {
+		if (buf_is_complete)
+			fuse_req_parse_extensions(req, in->total_extlen, in,
+						  in->len);
+		else
+			fuse_log(FUSE_LOG_WARNING,
+				"fuse: %s: %zu extension bytes outside the header buffer, ignored\n",
+				opname((enum fuse_opcode) in->opcode),
+				FUSE_EXT_SIZE(in->total_extlen));
+	}
+
+	if (se->debug && req->secctx_len > 0) {
+		fuse_log(FUSE_LOG_DEBUG,
+			"  secctx: %zu bytes (%u contexts)\n",
+			req->secctx_len,
+			req->secctx_count);
 	}
 
 	inarg = (void *) &in[1];
@@ -3804,7 +4296,18 @@ void fuse_session_process_uring_cqe(struct fuse_session *se,
 {
 	int err;
 
+	/* For io_uring, extensions are in the payload buffer, not appended to 'in' header. */
+	tsan_acquire_request(se);
 	fuse_session_in2req(req, in);
+	if (in->total_extlen)
+		fuse_req_parse_extensions(req, in->total_extlen, op_payload, payload_len);
+
+	if (se->debug && req->secctx_len > 0) {
+		fuse_log(FUSE_LOG_DEBUG,
+			"  uring secctx: %zu bytes (%u contexts)\n",
+			req->secctx_len,
+			req->secctx_count);
+	}
 
 	err = fuse_req_opcode_sanity_ok(se, in->opcode);
 	if (err)
@@ -3815,7 +4318,7 @@ void fuse_session_process_uring_cqe(struct fuse_session *se,
 		goto reply_err;
 
 	err = ENOSYS;
-	if (in->opcode >= FUSE_MAXOP || !fuse_ll_ops[in->opcode].func)
+	if (in->opcode >= FUSE_MAXOP || !fuse_ll_ops2[in->opcode].func)
 		goto reply_err;
 
 	if (se->debug) {
@@ -3838,7 +4341,7 @@ void fuse_session_process_uring_cqe(struct fuse_session *se,
 	} else if (in->opcode == FUSE_NOTIFY_REPLY) {
 		struct fuse_buf buf = { .size = payload_len,
 					.mem = op_payload };
-		do_notify_reply(req, in->nodeid, op_in, &buf);
+		_do_notify_reply(req, in->nodeid, op_payload, &buf);
 	} else {
 		fuse_ll_ops2[in->opcode].func(req, in->nodeid, op_in,
 					      op_payload);
@@ -3858,8 +4361,9 @@ static const struct fuse_opt fuse_ll_opts[] = {
 	LL_OPTION("-d", debug, 1),
 	LL_OPTION("--debug", debug, 1),
 	LL_OPTION("allow_root", deny_others, 1),
-	LL_OPTION("io_uring", uring.enable, 1),
+	LL_OPTION("io_uring", uring.enabled, 1),
 	LL_OPTION("io_uring_q_depth=%u", uring.q_depth, -1),
+	LL_OPTION("io_uring_bufpool", uring.bufpool, 1),
 	FUSE_OPT_END
 };
 
@@ -3880,17 +4384,14 @@ void fuse_lowlevel_help(void)
 "    -o auto_unmount        auto unmount on process termination\n"
 "    -o io_uring            enable io-uring\n"
 "    -o io_uring_q_depth=<n> io-uring queue depth\n"
+"    -o io_uring_bufpool    let the kernel manage the memory regions for queues\n"
 );
 }
 
-void fuse_session_destroy(struct fuse_session *se)
+static void fuse_session_free(struct fuse_session *se)
 {
 	struct fuse_ll_pipe *llp;
 
-	if (se->got_init && !se->got_destroy) {
-		if (se->op.destroy)
-			se->op.destroy(se->userdata);
-	}
 	llp = pthread_getspecific(se->pipe_key);
 	if (llp != NULL)
 		fuse_ll_pipe_free(llp);
@@ -3901,19 +4402,68 @@ void fuse_session_destroy(struct fuse_session *se)
 	free(se->cuse_data);
 	if (se->fd != -1)
 		close(se->fd);
+	/* Closing this lets the auto_unmount fusermount3 helper exit. */
+	if (se->auto_unmount_fd != -1)
+		close(se->auto_unmount_fd);
 	if (se->io != NULL)
 		free(se->io);
 	destroy_mount_opts(se->mo);
 
+	free(atomic_exchange(&se->mountpoint, NULL));
+	free(se);
+}
+
+void fuse_session_get(struct fuse_session *se)
+{
+	se->ref_cnt++;
+}
+
+void fuse_session_put(struct fuse_session *se)
+{
+	if (--se->ref_cnt != 0)
+		return;
+
+	/*
+	 * The caller still owns se here, so freeing it would be worse than
+	 * leaking it. Leak and name the bug instead.
+	 */
+	if (!se->destroy_called) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: session released before fuse_session_destroy()\n");
+		PANIC_IF_PEDANTIC();
+		return;
+	}
+
+	fuse_session_free(se);
+}
+
+void fuse_session_destroy(struct fuse_session *se)
+{
+	/* on the caller's thread: userdata may not outlive this call */
+	if (READ_ONCE(se->got_init) && !se->got_destroy) {
+		if (se->op.destroy)
+			se->op.destroy(se->userdata);
+	}
+	fuse_ll_clear_pipe(se);
+
+	/* each one holds a session reference; nothing pops them anymore */
+	pthread_mutex_lock(&se->lock);
+	while (se->interrupts.next != &se->interrupts)
+		destroy_parked_interrupt(se->interrupts.next);
+	pthread_mutex_unlock(&se->lock);
+
+	/* the caller may stop the watchdog as soon as we return */
 	if (se->timeout_thread) {
 		pthread_mutex_lock(&se->timeout_thread->lock);
 		se->timeout_thread->session_destructed = true;
 		se->timeout_thread->fuse_session_fd = -1;
 		se->timeout_thread->se = NULL;
 		pthread_mutex_unlock(&se->timeout_thread->lock);
+		fuse_session_watchdog_wake(se->timeout_thread);
 	}
 
-	free(se);
+	se->destroy_called = true;
+	fuse_session_put(se);
 }
 
 
@@ -3981,7 +4531,8 @@ pipe_retry:
 	bufsize = se->bufsize;
 
 	if (se->conn.proto_minor < 14 ||
-	    !(se->conn.want_ext & FUSE_CAP_SPLICE_READ))
+	    !(se->conn.want_ext & FUSE_CAP_SPLICE_READ) ||
+	    READ_ONCE(se->splice_read_off))
 		goto fallback;
 
 	llp = fuse_ll_get_pipe(se);
@@ -3991,20 +4542,12 @@ pipe_retry:
 	if (llp->size < bufsize) {
 		if (llp->can_grow) {
 			res = fcntl(llp->pipe[0], F_SETPIPE_SZ, bufsize);
-			if (res == -1) {
-				llp->can_grow = 0;
-				res = grow_pipe_to_max(llp->pipe[0]);
-				if (res > 0)
-					llp->size = res;
-				fuse_ll_clear_pipe(se);
-				goto fallback;
-			}
+			if (res == -1)
+				goto disable_splice_read;
 			llp->size = res;
 		}
-		if (llp->size < bufsize) {
-			fuse_ll_clear_pipe(se);
-			goto fallback;
-		}
+		if (llp->size < bufsize)
+			goto disable_splice_read;
 	}
 
 	if (se->io != NULL && se->io->splice_receive != NULL) {
@@ -4099,6 +4642,20 @@ pipe_retry:
 
 	return res;
 
+disable_splice_read:
+	llp->can_grow = 0;
+	WRITE_ONCE(se->splice_read_off, true);
+
+	/* splice read will never work, write _might_ */
+	if (se->conn.want_ext & FUSE_CAP_SPLICE_WRITE) {
+		res = grow_pipe_to_max(llp->pipe[0]);
+		if (res > 0)
+			llp->size = res;
+	} else {
+		/* pipe will not be used */
+		fuse_ll_clear_pipe(se);
+	}
+
 fallback:
 #endif
 	bufsize = internal ? buf->mem_size : se->bufsize;
@@ -4188,7 +4745,7 @@ int fuse_session_receive_buf_internal(struct fuse_session *se,
 	 * if run internally thread buffers are from libfuse - we can
 	 * reallocate them
 	 */
-	if (unlikely(!se->got_init) && !se->buf_reallocable)
+	if (unlikely(!READ_ONCE(se->got_init)) && !se->buf_reallocable)
 		se->buf_reallocable = true;
 
 	return _fuse_session_receive_buf(se, buf, ch, true);
@@ -4229,7 +4786,10 @@ fuse_session_new_versioned(struct fuse_args *args,
 		fuse_log(FUSE_LOG_ERR, "fuse: failed to allocate fuse object\n");
 		goto out1;
 	}
+	se->ref_cnt = 1;
 	se->fd = -1;
+	se->init_wakeup_fd = -1;
+	se->auto_unmount_fd = -1;
 	se->conn.max_write = FUSE_DEFAULT_MAX_PAGES_LIMIT * getpagesize();
 	se->bufsize = se->conn.max_write + FUSE_BUFFER_HEADER_SIZE;
 	se->conn.max_readahead = UINT_MAX;
@@ -4238,16 +4798,23 @@ fuse_session_new_versioned(struct fuse_args *args,
 	 * Allow overriding with env, mostly to avoid the need to modify
 	 * all tests. I.e. to test with and without io-uring being enabled.
 	 */
-	se->uring.enable = getenv("FUSE_URING_ENABLE") ?
+	se->uring.enabled = getenv("FUSE_URING_ENABLE") ?
 				   atoi(getenv("FUSE_URING_ENABLE")) :
 				   SESSION_DEF_URING_ENABLE;
 	se->uring.q_depth = getenv("FUSE_URING_QUEUE_DEPTH") ?
 				    atoi(getenv("FUSE_URING_QUEUE_DEPTH")) :
 				    SESSION_DEF_URING_Q_DEPTH;
+	se->uring.bufpool = getenv("FUSE_URING_BUFPOOL") ?
+				    atoi(getenv("FUSE_URING_BUFPOOL")) :
+				    SESSION_DEF_URING_BUFPOOL;
 
 	/* Parse options */
 	if(fuse_opt_parse(args, se, fuse_ll_opts, NULL) == -1)
 		goto out2;
+
+	if (se->uring.bufpool)
+		se->uring.enabled = true;
+
 	if(se->deny_others) {
 		/* Allowing access only by root is done by instructing
 		 * kernel to allow access by everyone, and then restricting
@@ -4298,6 +4865,9 @@ fuse_session_new_versioned(struct fuse_args *args,
 	se->userdata = userdata;
 
 	se->mo = mo;
+
+	/* -Dsync-init; fuse_session_set_sync_init() still overrides it. */
+	se->want_sync_init = FUSE_SYNC_INIT_DEFAULT;
 
 	/* Fuse server application should pass the version it was compiled
 	 * against and pass it. If a libfuse version accidentally introduces an
@@ -4355,6 +4925,14 @@ FUSE_SYMVER("fuse_session_custom_io_317", "fuse_session_custom_io@@FUSE_3.17")
 int fuse_session_custom_io_317(struct fuse_session *se,
 				const struct fuse_custom_io *io, size_t op_size, int fd)
 {
+#ifndef HAVE_CUSTOM_IO
+	(void)se;
+	(void)io;
+	(void)op_size;
+	(void)fd;
+	fuse_log(FUSE_LOG_ERR, "fuse: custom io is not enabled in this build\n");
+	return -ENOTSUP;
+#else
 	if (sizeof(struct fuse_custom_io) < op_size) {
 		fuse_log(FUSE_LOG_ERR, "fuse: warning: library too old, some operations may not work\n");
 		op_size = sizeof(struct fuse_custom_io);
@@ -4388,7 +4966,17 @@ int fuse_session_custom_io_317(struct fuse_session *se,
 
 	se->fd = fd;
 	memcpy(se->io, io, op_size);
+	/* fuse_uring registers se->fd as the ring's fixed file and issues
+	 * IORING_OP_URING_CMD against it, bypassing io->read/io->writev
+	 * entirely -- so on a caller-owned fd it would send uring commands to
+	 * whatever the caller passed in. Cleared rather than refused: there is
+	 * no API asking for io-uring, only the environment variable, so
+	 * refusing would let a stray variable break an application that never
+	 * asked for it.
+	 */
+	se->uring.enabled = 0;
 	return 0;
+#endif
 }
 
 int fuse_session_custom_io_30(struct fuse_session *se,
@@ -4400,6 +4988,421 @@ int fuse_session_custom_io_30(struct fuse_session *se,
 	return fuse_session_custom_io_317(se, io,
 			offsetof(struct fuse_custom_io, clone_fd), fd);
 }
+
+#if defined(HAVE_NEW_MOUNT_API)
+
+/* Worker thread for synchronous FUSE_INIT */
+static void *session_sync_init_worker(void *data)
+{
+	struct fuse_session *se = (struct fuse_session *)data;
+	struct fuse_buf fbuf = {
+		.mem = NULL,
+	};
+	struct pollfd pfds[2];
+
+	pfds[0].fd = se->fd;
+	pfds[0].events = POLLIN;
+	pfds[0].revents = 0;
+	pfds[1].fd = se->init_wakeup_fd;
+	pfds[1].events = POLLIN;
+	pfds[1].revents = 0;
+
+	/*
+	 * Process requests until mount completes. With SELinux there may be
+	 * additional requests (like getattr) after FUSE_INIT before mount
+	 * returns.
+	 */
+	while (true) {
+		int res = poll(pfds, 2, -1);
+
+		if (res == -1) {
+			if (errno == EINTR)
+				continue;
+			se->init_error = -errno;
+			break;
+		}
+
+		if (pfds[1].revents & POLLIN)
+			break;
+
+		if (pfds[0].revents & POLLIN) {
+			res = fuse_session_receive_buf_internal(se, &fbuf, NULL);
+			if (res == -EINTR)
+				continue;
+			if (res <= 0) {
+				se->init_error = res < 0 ? res : -EINVAL;
+				break;
+			}
+
+			fuse_session_process_buf_internal(se, &fbuf, NULL);
+		}
+	}
+
+	fuse_buf_free(&fbuf);
+	return NULL;
+}
+
+/*
+ * Enable synchronous FUSE_INIT and start worker thread
+ *
+ * Sets se->is_sync_init to true if sync init is enabled.
+ * Returns 0 on success or kernel does not support it, -errno on unexpected failure
+ */
+static int session_start_sync_init(struct fuse_session *se, int fd)
+{
+	int err, res;
+
+	se->is_sync_init = false;
+
+	/*
+	 * Older fuse servers do not set want_sync_init or start the new
+	 * daemonize code, so they get async init.
+	 */
+	if (se->want_sync_init == FUSE_SYNC_INIT_DISABLED ||
+	    (se->want_sync_init == FUSE_SYNC_INIT_AUTO &&
+	     !fuse_daemonize_early_is_used())) {
+		if (se->debug)
+			fuse_log(FUSE_LOG_DEBUG,
+					"fuse: sync init not enabled\n");
+		return 0;
+	}
+
+	/* Try to enable synchronous FUSE_INIT */
+	res = ioctl(fd, FUSE_DEV_IOC_SYNC_INIT);
+	if (res) {
+		err = errno;
+		if (err != ENOTTY) {
+			fuse_log(
+				FUSE_LOG_ERR,
+				"fuse: failed to enable sync init: %s\n",
+				strerror(errno));
+			return -err;
+		}
+		/*
+		 * ENOTTY means kernel doesn't support sync init,
+		 * not an error
+		 */
+		if (se->debug)
+			fuse_log(
+				FUSE_LOG_DEBUG,
+				"fuse: kernel doesn't support sync init\n");
+		return 0;
+	}
+
+	if (se->debug)
+		fuse_log(FUSE_LOG_DEBUG,
+				"fuse: synchronous FUSE_INIT enabled\n");
+
+	se->init_error = 0;
+
+	se->init_wakeup_fd = eventfd(0, EFD_CLOEXEC);
+	if (se->init_wakeup_fd == -1) {
+		fuse_log(
+			FUSE_LOG_ERR,
+			"fuse: failed to create eventfd for init worker: %s\n",
+			strerror(errno));
+		return -EIO;
+	}
+
+	/* Must be set before the worker exists - it reads this in _do_init() */
+	se->is_sync_init = true;
+
+	err = pthread_create(&se->init_thread, NULL,
+				session_sync_init_worker, se);
+	if (err != 0) {
+		fuse_log(
+			FUSE_LOG_ERR,
+			"fuse: failed to create init worker thread: %s\n",
+			strerror(err));
+		se->is_sync_init = false;
+		close(se->init_wakeup_fd);
+		se->init_wakeup_fd = -1;
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/* Wait for synchronous FUSE_INIT to complete */
+static int session_wait_sync_init_completion(struct fuse_session *se)
+{
+	void *retval;
+	int err;
+	uint64_t val = 1;
+
+	if (se->init_wakeup_fd == -1)
+		return 0;
+
+	if (se->init_wakeup_fd != -1) {
+		ssize_t res = write(se->init_wakeup_fd, &val, sizeof(val));
+
+		if (res != sizeof(val)) {
+			fuse_log(FUSE_LOG_ERR,
+				 "fuse: failed to signal init worker: %s\n",
+				 strerror(errno));
+		}
+	}
+
+	err = pthread_join(se->init_thread, &retval);
+	if (err != 0) {
+		fuse_log(FUSE_LOG_ERR, "fuse: failed to join init worker thread: %s\n",
+			 strerror(err));
+		goto err;
+	}
+
+	if (se->init_wakeup_fd != -1) {
+		close(se->init_wakeup_fd);
+		se->init_wakeup_fd = -1;
+	}
+
+	se->init_thread = 0;
+
+	if (se->init_error != 0) {
+		fuse_log(FUSE_LOG_ERR, "fuse: init worker failed: %s\n",
+			 strerror(-se->init_error));
+		goto err;
+	}
+
+	if (fuse_session_exited(se)) {
+		fuse_log(FUSE_LOG_ERR, "FUSE_INIT failed: session exited\n");
+		goto err;
+	}
+
+	return 0;
+
+err:
+	se->is_sync_init = false;
+	return -1;
+}
+
+/*
+ * Handle fallback to fusermount3 when privileged mount fails with EPERM.
+ * Returns: new fd on success, negative error code on failure
+ */
+static int new_api_fusermount(struct fuse_session *se,
+			      const char *mountpoint,
+			      const char *mtab_opts,
+			      int *sock_fd, pid_t *fusermount_pid)
+{
+	const uint64_t required_features =
+		FUSERMOUNT_FEATURE_NEW_MOUNT_API |
+		FUSERMOUNT_FEATURE_SYNC_INIT;
+	uint64_t features;
+	int fd, err;
+
+	if (se->debug)
+		fuse_log(FUSE_LOG_DEBUG,
+			 "fuse: privileged mount failed with EPERM, falling back to fusermount3\n");
+
+	/* Terminate worker thread with wrong fd */
+	if (session_wait_sync_init_completion(se) < 0)
+		fuse_log(FUSE_LOG_ERR, "fuse: sync init completion failed\n");
+
+	features = fuse_mount_fusermount_features();
+	if ((features & required_features) != required_features) {
+		if (se->debug)
+			fuse_log(FUSE_LOG_DEBUG,
+				 "fuse: fusermount3 lacks new mount API sync-init support\n");
+		return -ENOTSUP;
+	}
+
+	/* Call fusermount3 with --sync-init */
+	fd = mount_fusermount_obtain_fd(mountpoint, se->mo, mtab_opts, sock_fd,
+					fusermount_pid);
+	if (fd < 0) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: fusermount3 sync-init failed\n");
+		return -ENOTSUP;
+	}
+
+	/* Start worker thread with correct fd from fusermount3 */
+	se->fd = fd;
+	err = session_start_sync_init(se, fd);
+	if (err) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: failed to start sync init worker\n");
+		close(fd);
+		se->fd = -1;
+		return err;
+	}
+
+	/* Send proceed signal and wait for mount result */
+	err = fuse_fusermount_proceed_mnt(*sock_fd);
+	if (err < 0) {
+		close(fd);
+		se->fd = -1;
+		return -EIO;
+	}
+
+	return fd;
+}
+
+/*
+ * Mount using the new Linux mount API (fsopen/fsconfig/fsmount/move_mount)
+ * Sync-init is only supported with the new API, as the mount might hang
+ * in case of daemon crash during FUSE_INIT. That also means once the sync init
+ * ioctl succeed fallback is not allowed anymore.
+ * Returns: fd on success, -1 on failure
+ */
+static int fuse_session_mount_new_api(struct fuse_session *se,
+				      const char *mountpoint)
+{
+	int fd = -1;
+	int sock_fd = -1;
+	int mountfd = -1;
+	pid_t fusermount_pid = -1;
+	int res, err;
+	char *mtab_opts = NULL;
+	char *mtab_opts_with_fd = NULL;
+	char fd_opt[32];
+
+	res = fuse_kern_mount_get_base_mtab_opts(se->mo, &mtab_opts);
+	err = -EIO;
+	if (res == -1) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: failed to get base mount options\n");
+		goto err;
+	}
+
+	fd = fuse_kern_mount_prepare(mountpoint, se->mo);
+	if (fd == -1) {
+		fuse_log(FUSE_LOG_ERR, "Mount preparation failed.\n");
+		goto err;
+	}
+
+	se->fd = fd;
+
+	/*
+	 * An armed worker blocks in poll() until a mount attaches to the fd.
+	 * A refused fsopen() never does that, and pthread_join() would hang.
+	 */
+	err = fuse_fsopen_probe();
+	if (err == -EPERM)
+		goto fallback;
+
+	err = session_start_sync_init(se, fd);
+	if (err)
+		goto err;
+
+	snprintf(fd_opt, sizeof(fd_opt), "fd=%i", fd);
+	err = -ENOMEM;
+	if (fuse_opt_add_opt(&mtab_opts_with_fd, mtab_opts) == -1 ||
+	    fuse_opt_add_opt(&mtab_opts_with_fd, fd_opt) == -1) {
+		goto err;
+	}
+
+	/* Try to mount directly */
+	err = fuse_kern_fsmount_mo(mountpoint, se->mo, mtab_opts_with_fd,
+				   &mountfd);
+
+fallback:
+	/* If mount failed with EPERM, fall back to fusermount3 with sync-init */
+	if (err < 0 && errno == EPERM) {
+		char *fusermount_opts = NULL;
+
+		close(fd);
+		fd = -1;
+		se->fd = -1;
+		/*
+		 * fusermount3 receives fsname/subtype (and other fusermount
+		 * options) only via -o, so mirror the legacy fuse_kern_mount()
+		 * fallback here. mtab_opts carries just the kernel/mtab options;
+		 * without appending these the subtype/fsname is lost and the
+		 * mount comes up as plain "fuse".
+		 */
+		if (fuse_opt_add_opt(&fusermount_opts, mtab_opts) == -1 ||
+		    (se->mo->fusermount_opts &&
+		     fuse_opt_add_opt(&fusermount_opts,
+				      se->mo->fusermount_opts) == -1) ||
+		    (se->mo->subtype_opt &&
+		     fuse_opt_add_opt(&fusermount_opts,
+				      se->mo->subtype_opt) == -1)) {
+			free(fusermount_opts);
+			err = -ENOMEM;
+			goto err;
+		}
+
+		fd = new_api_fusermount(se, mountpoint, fusermount_opts,
+					&sock_fd, &fusermount_pid);
+		free(fusermount_opts);
+		if (fd < 0) {
+			err = fd;
+			goto err_with_sock;
+		}
+		err = 0;
+	} else if (err < 0) {
+		/* Mount failed with non-EPERM error, bail out */
+		goto err;
+	}
+
+err_with_sock:
+	if (sock_fd >= 0) {
+		if (err == 0 && se->mo->auto_unmount) {
+			/*
+			 * Under auto_unmount fusermount3 --sync-init stays alive
+			 * until this socket closes (its unmount trigger), so
+			 * closing it now would unmount early and waitpid() would
+			 * hang. Keep it; fuse_session_destroy() closes it.
+			 */
+			se->auto_unmount_fd = sock_fd;
+		} else {
+			close(sock_fd);
+			/* Reap fusermount3 child process to prevent zombie */
+			if (fusermount_pid > 0)
+				waitpid(fusermount_pid, NULL, 0);
+		}
+	} else if (err == 0 && se->mo->auto_unmount) {
+		/*
+		 * Direct fsmount(), no fusermount3 in the picture - spawn the
+		 * helper that unmounts once its socket closes.
+		 */
+		se->auto_unmount_fd = setup_auto_unmount(mountpoint, 0);
+		if (se->auto_unmount_fd < 0) {
+			fuse_kern_umount_mountfd(mountfd);
+			err = -EIO;
+		}
+	}
+err:
+	if (mountfd >= 0)
+		close(mountfd);
+
+	if (err < 0) {
+		/* Close fd first to unblock worker thread */
+		if (fd >= 0)
+			close(fd);
+		fd = -1;
+		se->fd = -1;
+		se->error = err;
+		se->is_sync_init = false;
+	}
+
+	/* Wait for synchronous FUSE_INIT to complete */
+	if (session_wait_sync_init_completion(se) < 0)
+		fuse_log(FUSE_LOG_ERR, "fuse: sync init completion failed\n");
+
+	/*
+	 * For sync init the ring threads were not woken in _do_init() because
+	 * the connection was not yet initialized. Now that the mount has
+	 * completed, the connection is initialized and REGISTER can be sent, so
+	 * wake them here
+	 */
+	if (se->is_sync_init && se->uring.enabled)
+		fuse_uring_wake_ring_threads(se);
+
+	free(mtab_opts);
+	free(mtab_opts_with_fd);
+	return fd;
+}
+#else
+static int fuse_session_mount_new_api(struct fuse_session *se,
+				      const char *mountpoint)
+{
+	(void)se;
+	(void)mountpoint;
+
+	return -1;
+}
+#endif
 
 int fuse_session_mount(struct fuse_session *se, const char *_mountpoint)
 {
@@ -4428,6 +5431,8 @@ int fuse_session_mount(struct fuse_session *se, const char *_mountpoint)
 			close(fd);
 	} while (fd >= 0 && fd <= 2);
 
+	/* Open channel */
+
 	/*
 	 * To allow FUSE daemons to run without privileges, the caller may open
 	 * /dev/fuse before launching the file system and pass on the file
@@ -4445,14 +5450,21 @@ int fuse_session_mount(struct fuse_session *se, const char *_mountpoint)
 		goto out;
 	}
 
-	/* Open channel */
-	fd = fuse_kern_mount(mountpoint, se->mo);
-	if (fd == -1)
-		goto error_out;
+	/* new linux mount api (and sync init) */
+	fd = fuse_session_mount_new_api(se, mountpoint);
+
+	/* fall back to old API, possible as long as another fd is used */
+	if (fd < 0) {
+		se->error = 0; /* reset error of new api */
+		fd = fuse_kern_mount(mountpoint, se->mo);
+		if (fd < 0)
+			goto error_out;
+	}
 
 out:
 	se->fd = fd;
 	se->mountpoint = mountpoint;
+	fuse_daemonize_early_set_mounted();
 
 	return 0;
 
@@ -4471,6 +5483,7 @@ void fuse_session_unmount(struct fuse_session *se)
 	if (se->mountpoint != NULL) {
 		char *mountpoint = atomic_exchange(&se->mountpoint, NULL);
 
+		fuse_session_watchdog_drop_session_fd(se);
 		fuse_kern_unmount(mountpoint, se->fd);
 		se->fd = -1;
 		free(mountpoint);
@@ -4488,7 +5501,7 @@ int fuse_req_getgroups(fuse_req_t req, int size, gid_t list[])
 	unsigned long pid = req->ctx.pid;
 	char *s;
 
-	sprintf(path, "/proc/%lu/task/%lu/status", pid, pid);
+	snprintf(path, sizeof(path), "/proc/%lu/task/%lu/status", pid, pid);
 
 retry:
 	buf = malloc(bufsize);
@@ -4573,7 +5586,7 @@ int fuse_session_exited(struct fuse_session *se)
 	return exited ? 1 : 0;
 }
 
-static void fuse_tt_destruct(struct fuse_timeout_thread *tt)
+static void fuse_session_watchdog_destruct(struct fuse_timeout_thread *tt)
 {
 	if (tt->eventfd != -1)
 		close(tt->eventfd);
@@ -4581,7 +5594,7 @@ static void fuse_tt_destruct(struct fuse_timeout_thread *tt)
 	free(tt);
 }
 
-static void fuse_tt_pollerr_handler(struct fuse_timeout_thread *tt)
+static void fuse_session_watchdog_pollerr_handler(struct fuse_timeout_thread *tt)
 {
 	pthread_mutex_lock(&tt->lock);
 	if (!tt->session_destructed) {
@@ -4604,15 +5617,19 @@ static void *fuse_session_teardown_watchdog(void *arg)
 	int res;
 	int poll_timeout = -1; /* infinity poll */
 	int nfds;
+	int session_fd;
 	int session_fd_idx;
 	int eventfd_idx;
 
 restart:
 	session_fd_idx = -1;
 	nfds = 0;
-	if (tt->fuse_session_fd >= 0) {
+	pthread_mutex_lock(&tt->lock);
+	session_fd = tt->fuse_session_fd;
+	pthread_mutex_unlock(&tt->lock);
+	if (session_fd >= 0) {
 		/* Poll on session fd for POLLERR */
-		pfds[nfds].fd = tt->fuse_session_fd;
+		pfds[nfds].fd = session_fd;
 		pfds[nfds].events = 0;
 		session_fd_idx = nfds;
 		nfds++;
@@ -4632,20 +5649,35 @@ restart:
 				continue;
 			break;
 		} else if (res > 0) {
-			/* Check for POLLERR on session fd */
-			if (session_fd_idx >= 0 &&
-			    pfds[session_fd_idx].revents & (POLLERR | POLLNVAL)) {
-				fuse_tt_pollerr_handler(tt);
+			bool fd_dropped = false;
+
+			/* Check for teardown signal on eventfd */
+			if (pfds[eventfd_idx].revents & POLLIN) {
+				uint64_t val;
+				bool stop;
+
+				if (read(tt->eventfd, &val, sizeof(val)) == -1)
+					fuse_log(FUSE_LOG_ERR,
+						 "fuse: failed to read eventfd: %s\n",
+						 strerror(errno));
+				pthread_mutex_lock(&tt->lock);
+				stop = tt->stop_requested;
+				pthread_mutex_unlock(&tt->lock);
+
+				/* Teardown requested, exit thread */
+				if (stop)
+					break;
+				fd_dropped = true;
+			}
+
+			/* A dropped session fd is a lost connection, as POLLERR */
+			if (fd_dropped || (session_fd_idx >= 0 &&
+			    pfds[session_fd_idx].revents & (POLLERR | POLLNVAL))) {
+				fuse_session_watchdog_pollerr_handler(tt);
 
 				/* Timeout for hard exit */
 				poll_timeout = tt->timeout_sec * 1000;
 				goto restart;
-			}
-
-			/* Check for teardown signal on eventfd */
-			if (pfds[eventfd_idx].revents & POLLIN) {
-				/* Teardown requested, exit thread */
-				break;
 			}
 		}
 
@@ -4707,6 +5739,7 @@ void *fuse_session_start_teardown_watchdog(struct fuse_session *se,
 	tt->eventfd = -1;
 	pthread_mutex_init(&tt->lock, NULL);
 	tt->session_destructed = false;
+	tt->stop_requested = false;
 	if (se->timeout_thread) {
 		fuse_log(FUSE_LOG_ERR,
 			 "fuse: timeout thread already running\n");
@@ -4734,26 +5767,54 @@ void *fuse_session_start_teardown_watchdog(struct fuse_session *se,
 	return tt;
 
 err:
-	fuse_tt_destruct(tt);
+	fuse_session_watchdog_destruct(tt);
 	return NULL;
 }
 
 void fuse_session_stop_teardown_watchdog(void *data)
 {
 	struct fuse_timeout_thread *tt;
-	uint64_t val = 1;
 
 	if (data == NULL)
 		return;
 	tt = (struct fuse_timeout_thread *)data;
 
+	pthread_mutex_lock(&tt->lock);
+	tt->stop_requested = true;
+	pthread_mutex_unlock(&tt->lock);
+
 	/* Signal the eventfd to wake up the thread */
-	if (write(tt->eventfd, &val, sizeof(val)) == -1) {
-		fuse_log(FUSE_LOG_ERR, "fuse: failed to signal eventfd: %s\n",
-			 strerror(errno));
-	}
+	fuse_session_watchdog_wake(tt);
 
 	/* Wait for thread to finish */
 	pthread_join(tt->thread_id, NULL);
-	fuse_tt_destruct(tt);
+
+	/* the session outlives the watchdog and must not see the freed tt */
+	pthread_mutex_lock(&tt->lock);
+	if (tt->se)
+		tt->se->timeout_thread = NULL;
+	pthread_mutex_unlock(&tt->lock);
+
+	fuse_session_watchdog_destruct(tt);
+}
+
+void fuse_session_set_sync_init(struct fuse_session *se, bool enable)
+{
+	if (se == NULL)
+		return;
+
+	se->want_sync_init = enable ? FUSE_SYNC_INIT_ENABLED :
+				      FUSE_SYNC_INIT_DISABLED;
+}
+
+void fuse_session_set_debug(struct fuse_session *se)
+{
+	se->debug = 1;
+}
+
+bool fuse_conn_is_sync_init(const struct fuse_conn_info *conn)
+{
+	const struct fuse_session *se = container_of(conn, struct fuse_session, conn);
+
+	return se->is_sync_init;
 }

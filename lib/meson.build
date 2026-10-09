@@ -2,12 +2,22 @@ libfuse_sources = ['fuse.c', 'fuse_i.h', 'fuse_loop.c', 'fuse_loop_mt.c',
                    'fuse_lowlevel.c', 'fuse_misc.h', 'fuse_opt.c',
                    'fuse_signals.c', 'buffer.c', 'cuse_lowlevel.c',
                    'helper.c', 'modules/subdir.c', 'mount_util.c',
-                   'fuse_log.c', 'compat.c', 'util.c', 'util.h' ]
+                   'fuse_log.c', 'compat.c', 'util.c', 'util.h',
+                   'fuse_daemonize.c' ]
 
 if host_machine.system().startswith('linux')
    libfuse_sources += [ 'mount.c' ]
+   if private_cfg.get('HAVE_NEW_MOUNT_API', false)
+      libfuse_sources += [ 'mount_fsmount.c' ]
+   endif
 else
    libfuse_sources += [ 'mount_bsd.c' ]
+endif
+
+if private_cfg.get('HAVE_SERVICEMOUNT', false)
+  libfuse_sources += [ 'fuse_service.c' ]
+else
+  libfuse_sources += [ 'fuse_service_stub.c' ]
 endif
 
 deps = [ thread_dep ]
@@ -22,7 +32,6 @@ endif
 if private_cfg.get('HAVE_URING', false)
   libfuse_sources += [ 'fuse_uring.c' ]
   deps += [ dependency('liburing') ]
-  deps += [ dependency('numa') ]
 endif
 
 
@@ -49,18 +58,25 @@ libfuse = library('fuse3',
                   dependencies: deps,
                   install: true,
                   link_depends: 'fuse_versionscript',
-                  c_args: [ '-DFUSE_USE_VERSION=317',
+                  c_args: [ '-DFUSE_USE_VERSION=319',
                             '-DFUSERMOUNT_DIR="@0@"'.format(fusermount_path) ],
                   link_args: ['-Wl,--version-script,' + meson.current_source_dir()
                               + '/fuse_versionscript' ])
 
+vars = []
+if private_cfg.get('HAVE_SERVICEMOUNT', false)
+  service_socket_dir = private_cfg.get_unquoted('FUSE_SERVICE_SOCKET_DIR', '')
+  vars += ['service_socket_dir=' + service_socket_dir]
+  vars += ['service_socket_perms=' + service_socket_perms]
+endif
 pkg = import('pkgconfig')
 pkg.generate(libraries: [ libfuse, '-lpthread' ],
              libraries_private: '-ldl',
              version: meson.project_version(),
              name: 'fuse3',
              description: 'Filesystem in Userspace',
-             subdirs: 'fuse3')
+             subdirs: 'fuse3',
+             variables: vars)
 
 libfuse_dep = declare_dependency(include_directories: include_dirs,
                                  link_with: libfuse, dependencies: deps)
