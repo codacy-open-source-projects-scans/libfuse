@@ -73,8 +73,11 @@ struct fuse_file_info {
 	    operation. */
 	uint32_t flush : 1;
 
-	/** Can be filled in by open, to indicate that the file is not
-	    seekable. */
+	/**
+	 * Can be filled in by open, to indicate that the file is not
+	 * seekable. 'stream' is preferred for pipe-like files, see
+	 * <libfuse>/doc/README.stream.
+	 */
 	uint32_t nonseekable : 1;
 
 	/* Indicates that flock locks for this file should be
@@ -104,8 +107,15 @@ struct fuse_file_info {
 	 */
 	uint32_t kill_suidgid : 1;
 
+	/**
+	 * Can be filled in by open, to indicate that the file has no
+	 * position. Implies 'nonseekable'. Needs direct_io, see
+	 * <libfuse>/doc/README.stream.
+	 */
+	uint32_t stream : 1;
+
 	/** Padding.  Reserved for future use*/
-	uint32_t padding : 22;
+	uint32_t padding : 21;
 	uint32_t padding2 : 32;
 	uint32_t padding3 : 32;
 
@@ -280,11 +290,21 @@ struct fuse_loop_config_v1 {
  * request. If the new mtime differs from the previous value, any
  * cached file *contents* will be invalidated as well.
  *
- * This flag should always be set when available. If all file changes
- * go through the kernel, *attr_timeout* should be set to a very large
- * number to avoid unnecessary getattr() calls.
+ * This flag should be set with care. The kernel also invalidates the cache
+ * after its own write-through writes, and a read racing with such a write
+ * can cache data the server has not received yet.
+ * https://lore.kernel.org/r/20251009110623.3115511-1-giveme.gulu@gmail.com
  *
- * This feature is enabled by default when supported by the kernel.
+ * To see changes made outside the kernel without this flag, set
+ * fi->direct_io in open(), or call fuse_lowlevel_notify_inval_inode() when
+ * the backing data changes. Without fi->keep_cache, the cache is also
+ * dropped on every open.
+ *
+ * If all file changes go through the kernel, *attr_timeout* should be set
+ * to a very large number to avoid unnecessary getattr() calls.
+ *
+ * This flag was enabled by default in libfuse3, but is disabled by default
+ * again for FUSE_USE_VERSION >= 319.
  */
 #define FUSE_CAP_AUTO_INVAL_DATA (1UL << 12)
 
@@ -1151,7 +1171,7 @@ void fuse_loop_cfg_set_clone_fd(struct fuse_loop_config *config,
 				unsigned int value);
 
 /**
- * Convert old config to more recernt fuse_loop_config2
+ * Convert old config to more recent fuse_loop_config2
  *
  * @param config current config2 type
  * @param v1_conf older config1 type (below FUSE API 312)
@@ -1178,7 +1198,7 @@ bool fuse_set_feature_flag(struct fuse_conn_info *conn, uint64_t flag);
 void fuse_unset_feature_flag(struct fuse_conn_info *conn, uint64_t flag);
 
 /**
- * Get the value of a feature flag in the want_ext field of fuse_conn_info.
+ * Get the value of a feature flag in the capable_ext field of fuse_conn_info.
  *
  * @param conn connection information
  * @param flag feature flag to be checked
@@ -1207,7 +1227,7 @@ bool fuse_set_conn_flag(struct fuse_conn_info *conn, uint64_t flag);
 
 /*
  * DO NOT USE: Not part of public API, for internal test use only.
- * The function signature or any use of it is not guaranteeed to
+ * The function signature or any use of it is not guaranteed to
  * remain stable. And neither are results of what this function does.
  */
 int fuse_convert_to_conn_want_ext(struct fuse_conn_info *conn);
